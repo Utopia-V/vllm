@@ -5,6 +5,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .base import RopeRotation
 from .mrope import MRotaryEmbedding
 
 
@@ -255,6 +256,11 @@ class BailingMRotaryEmbedding(MRotaryEmbedding):
             dtype,
             mrope_section=mrope_section,
         )
+
+    def get_rotation(self, positions: torch.Tensor, dtype: torch.dtype) -> RopeRotation:
+        cache = self._cos_sin_cache_as(dtype, positions.device)
+        cos_sin = torch.cat(self.select_cos_sin(positions, cache), dim=-1)
+        return RopeRotation(None, cos_sin, self.is_neox_style)
 
     def select_cos_sin(
         self,

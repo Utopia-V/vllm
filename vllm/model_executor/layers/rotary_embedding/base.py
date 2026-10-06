@@ -2,12 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
+from typing import NamedTuple
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
 
 from .common import ApplyRotaryEmb
+
+
+class RopeRotation(NamedTuple):
+    """RoPE as data for fused kernels: token ``i`` is rotated by row
+    ``positions[i]`` (or ``i`` if None) of ``cos_sin``, laid out ``[cos | sin]``."""
+
+    positions: torch.Tensor | None
+    cos_sin: torch.Tensor
+    is_neox: bool
 
 
 # --8<-- [start:rotary_embedding]
@@ -103,32 +114,37 @@ class RotaryEmbeddingBase(CustomOp):
         return cache
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> torch.Tensor:
+        return self._cos_sin_cache_as(query.dtype, query.device)
+
+    def _cos_sin_cache_as(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
         cos_sin_cache = self.cos_sin_cache
-        if (
-            cos_sin_cache.device == query.device
-            and self.cos_sin_cache.dtype == query.dtype
-        ):
+        if cos_sin_cache.device == device and self.cos_sin_cache.dtype == dtype:
             return cos_sin_cache
 
         # Reuse precomputed bf16 cache in the AITER compile path.
-        if (
-            self.use_aiter
-            and torch.compiler.is_compiling()
-            and query.dtype == torch.bfloat16
-        ):
+        if self.use_aiter and torch.compiler.is_compiling() and dtype == torch.bfloat16:
             cache_bf16 = getattr(self, "cos_sin_cache_bf16", None)
-            if cache_bf16 is not None and cache_bf16.device == query.device:
+            if cache_bf16 is not None and cache_bf16.device == device:
                 return cache_bf16
 
-        cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+        cos_sin_cache = cos_sin_cache.to(device, dtype=dtype)
         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
         if torch.compiler.is_compiling():
             return cos_sin_cache
 
         self.cos_sin_cache = cos_sin_cache
         return cos_sin_cache
+
+    def get_rotation(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> RopeRotation | None:
+        """Describe this layer's rotation for `positions`, or return None if it
+        is not a plain per-token cos/sin rotation."""
+        return None
 
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
@@ -156,6 +172,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             dtype=dtype,
             init_cache=init_cache,
         )
+
+    def get_rotation(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> RopeRotation | None:
+        if positions.dim() != 1:
+            return None
+        cos_sin = self._cos_sin_cache_as(dtype, positions.device)
+        return RopeRotation(positions, cos_sin, self.is_neox_style)
 
     @staticmethod
     def forward_static(
